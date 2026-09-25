@@ -80,6 +80,13 @@ CREATE TABLE IF NOT EXISTS responses (
     p_correct                 REAL NOT NULL,
     information_at_theta      REAL NOT NULL,
     exposure_count_at_select  INTEGER NOT NULL,
+    -- Content tag of the answered item, frozen at answer time.  Quota
+    -- accounting (progress, /next tag deficits, the precision stop rule)
+    -- reads this frozen value, so re-importing the item with a different
+    -- tag or withdrawing it can never rewrite the attribution of an
+    -- already-answered item.  Legacy databases acquire the column via
+    -- ALTER TABLE plus a one-time backfill from the bank at upgrade time.
+    content_tag               TEXT,
     created_at                TEXT NOT NULL,
     UNIQUE (session_id, item_id) -- an item can only be answered once per session
 );
@@ -259,6 +266,42 @@ def _migrate_pause_support(conn: sqlite3.Connection) -> None:
         conn.isolation_level = previous_isolation
 
 
+def _migrate_response_content_tag(conn: sqlite3.Connection) -> None:
+    """Add ``responses.content_tag`` and backfill it exactly once.
+
+    The column freezes each answered item's content tag at answer time, so
+    quota accounting (progress, /next tag deficits, the precision stop
+    rule) is immune to later bank re-tagging or withdrawal.  Historical
+    rows are backfilled with the tag the bank carries *at upgrade time*
+    (the best available approximation of the tag when the answer was
+    given); blank bank tags are normalised to NULL, matching the importer.
+
+    The backfill runs only together with the ``ALTER TABLE`` — i.e. on the
+    first startup of an upgraded database — so the frozen values never
+    follow later bank edits, and new answers always write their own tag.
+    """
+    columns = {r[1] for r in conn.execute("PRAGMA table_info(responses)")}
+    if "content_tag" in columns:
+        return
+    conn.execute("ALTER TABLE responses ADD COLUMN content_tag TEXT")
+    conn.execute(
+        """
+        UPDATE responses
+           SET content_tag = (
+               SELECT NULLIF(i.content_tag, '')
+                 FROM items i
+                WHERE i.id = responses.item_id
+           )
+        """
+    )
+    # Commit the column and its backfill together: the ALTER alone may
+    # already be durable (DDL does not join the implicit transaction), and
+    # the column's presence is the "migration done" marker — leaving the
+    # UPDATE to a later, shared commit could roll it back while keeping
+    # the column, which would skip the backfill on every later startup.
+    conn.commit()
+
+
 def init_db() -> None:
     """Create tables (idempotent) and seed a deterministic demo bank once."""
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -284,6 +327,16 @@ def init_db() -> None:
             _ensure_column(
                 conn, "items", "is_active", "INTEGER NOT NULL DEFAULT 1"
             )
+
+        # Frozen per-answer content tag: a legacy responses table acquires
+        # the column plus a one-time backfill from the current bank (the
+        # best approximation of the tag at answer time).  Runs before the
+        # canonical schema below, which already carries the column for
+        # freshly created databases.
+        if conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='responses'"
+        ).fetchone() is not None:
+            _migrate_response_content_tag(conn)
 
         # Rebuild the sessions table on legacy databases (widening the status
         # CHECK requires it); executescript below then only creates the

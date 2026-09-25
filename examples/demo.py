@@ -23,7 +23,11 @@ It also demonstrates the item revision history: a formal import appends a
 version only for a new id or an actual content change, availability flips
 append withdraw/re_enable versions, while dry runs, failed batches and
 same-value retries create no version; old libraries receive an idempotent
-version-1 baseline at first startup.
+version-1 baseline at first startup.  The final section demonstrates that
+an answer freezes the item's content tag into the response record: quota
+accounting (progress, /next deficits, the precision stop rule) uses the
+frozen tag, so re-importing an answered item with a different tag or
+withdrawing it never rewrites the attribution of answers already given.
 """
 
 from __future__ import annotations
@@ -191,6 +195,7 @@ def main() -> None:
     demo_pause_resume()
     demo_withdrawal()
     demo_revisions()
+    demo_frozen_tags()
 
 
 def demo_pause_resume() -> None:
@@ -721,6 +726,95 @@ def demo_revisions() -> None:
         "GET", f"/api/items/{iid}/revisions/9999")
     assert status_code == 404, body
     print("  -> 未知题目与未知版本均返回 404 ✔")
+
+
+def demo_frozen_tags() -> None:
+    """Show that quota accounting uses the tag frozen at answer time."""
+    print("\n--- 作答时冻结内容标签 ---")
+
+    # 两道专用演示题：区分度远高于演示题库（a<=1.8），在 theta=0 附近必然
+    # 按 DEMO-FT-1 -> DEMO-FT-2 的顺序被选中，结果确定。重复运行时上一轮
+    # 可能已改标签或把题留在了撤回状态：先按原始标签重新导入并统一启用
+    # （导入保留启用状态与曝光数，故需要显式启用）。
+    def ft_item(iid: str, tag: str, discrimination: float) -> dict:
+        return {
+            "id": iid, "difficulty": 0.0, "discrimination": discrimination,
+            "content_tag": tag, "stem": f"冻结标签演示题 {iid}：1 + 1 = ?",
+            "options": [{"key": "A", "text": "2"}, {"key": "B", "text": "3"}],
+            "answer": "A",
+        }
+
+    call(
+        "POST", "/api/items/import",
+        {"items": [ft_item("DEMO-FT-1", "冻结甲", 5.0),
+                   ft_item("DEMO-FT-2", "冻结乙", 4.9)]},
+    )
+    for iid in ("DEMO-FT-1", "DEMO-FT-2"):
+        call("PATCH", f"/api/items/{iid}/availability", {"is_active": True})
+
+    # 配额 {冻结甲: 1}：先取并作答 DEMO-FT-1（当前标签 冻结甲）。
+    session = call(
+        "POST", "/api/sessions",
+        {"max_items": 2, "exposure_limit": 10_000,
+         "tag_minimums": {"冻结甲": 1}},
+    )
+    sid = session["id"]
+    chosen = call("POST", f"/api/sessions/{sid}/next")
+    assert chosen["item"]["id"] == "DEMO-FT-1"
+    result = call(
+        "POST", f"/api/sessions/{sid}/responses",
+        {"response_id": f"demo-ft-{sid[:8]}-1",
+         "item_id": "DEMO-FT-1", "response": "A"},
+    )
+    assert result["content_tag"] == "冻结甲", "答题记录应冻结作答时的标签"
+    progress = call("GET", f"/api/sessions/{sid}/progress")
+    assert progress["tag_answered"] == {"冻结甲": 1}
+    print("  -> 作答把题目当时的标签冻结进答题记录，进度按冻结标签统计 ✔")
+
+    # 正式导入把已答题目的标签改成 冻结乙：已答题归属不得随之改变。
+    call("POST", "/api/items/import",
+         {"items": [ft_item("DEMO-FT-1", "冻结乙", 5.0)]})
+    progress = call("GET", f"/api/sessions/{sid}/progress")
+    assert progress["tag_answered"] == {"冻结甲": 1}, progress["tag_answered"]
+    history = call("GET", f"/api/sessions/{sid}/responses")
+    assert history["results"][0]["content_tag"] == "冻结甲"
+    print("  -> 导入改标签后：答题记录与进度中的已答归属保持冻结值不变 ✔")
+
+    # 配额按冻结标签已满足：/next 不会重开 冻结甲 缺口（否则仅剩的 1 个
+    # 答题位会被限制到已没有 冻结甲 题的标签上，会话将以
+    # tag_minimums_unfulfillable 提前结束），而是在全部候选中正常选出
+    # DEMO-FT-2。
+    chosen = call("POST", f"/api/sessions/{sid}/next")
+    assert chosen["status"] == "active" and chosen["item"]["id"] == "DEMO-FT-2"
+    call(
+        "POST", f"/api/sessions/{sid}/responses",
+        {"response_id": f"demo-ft-{sid[:8]}-2",
+         "item_id": "DEMO-FT-2", "response": "A"},
+    )
+    progress = call("GET", f"/api/sessions/{sid}/progress")
+    assert progress["finish_reason"] == "max_items"
+    assert progress["tag_answered"] == {"冻结甲": 1, "冻结乙": 1}
+    show("配额会话结束（已答归属不受导入改标签影响）", {
+        "status": progress["status"],
+        "finish_reason": progress["finish_reason"],
+        "tag_minimums": progress["tag_minimums"],
+        "tag_answered": progress["tag_answered"],
+    })
+    print("  -> /next 欠额限制按冻结标签判定，配额不被追溯改写 ✔")
+
+    # 撤回已答题目同样不改写已答归属。
+    call("PATCH", "/api/items/DEMO-FT-1/availability", {"is_active": False})
+    progress = call("GET", f"/api/sessions/{sid}/progress")
+    assert progress["tag_answered"] == {"冻结甲": 1, "冻结乙": 1}
+    print("  -> 撤回已答题目后，已答归属仍保持冻结标签 ✔")
+
+    # 收尾：恢复 DEMO-FT-1 的原始标签并把两道演示题留在撤回状态，保证
+    # 重复运行本脚本时其他演示段落不受影响。
+    call("POST", "/api/items/import",
+         {"items": [ft_item("DEMO-FT-1", "冻结甲", 5.0)]})
+    for iid in ("DEMO-FT-1", "DEMO-FT-2"):
+        call("PATCH", f"/api/items/{iid}/availability", {"is_active": False})
+    print("  -> 演示题已恢复原始标签并撤回，不影响后续演示 ✔")
 
 
 if __name__ == "__main__":

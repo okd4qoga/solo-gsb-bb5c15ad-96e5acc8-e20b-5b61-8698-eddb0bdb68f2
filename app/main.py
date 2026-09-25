@@ -22,6 +22,14 @@ a real commit upserts every row in one serialised transaction (updates
 keep ``exposure_count`` and ``is_active``) and leaves the bank untouched
 if any row fails.
 
+Every stored answer freezes the item's ``content_tag`` into the response
+row at answer time, and every tag-quota statistic (progress, the /next
+deficit restriction, the precision stop rule) reads those frozen tags:
+re-importing an answered item with a different tag or withdrawing it can
+never rewrite its attribution, fake a satisfied quota or stop a session
+early.  Legacy response rows are backfilled once from the bank at startup
+and never follow later bank edits.
+
 ``PATCH /api/items/{id}/availability`` withdraws or re-enables one item.
 A withdrawn item no longer takes part in new selections; a session whose
 pending item was withdrawn clears it and re-selects inside the /next
@@ -142,9 +150,12 @@ app = FastAPI(
         "支持按 UTC 日期查询到期题与提交 0~5 分复习结果"
         "（review_id 绑定首次提交的复习题与评分：同题同分重放返回首次结果且不重复推进日程，"
         "题目或评分不同返回 409 且不改动结果与日程，冲突检查先于到期判断；"
-        "仅接受已到期题，同一写事务记录结果并推进日程）。"
+        "仅接受已到期题，同一写事务记录结果并推进日程）；"
+        "作答时把题目当时的内容标签冻结进答题记录，进度、/next 欠额限制与精度停测的"
+        "标签配额统计一律按冻结标签计算，之后导入改标签或撤回题目不会改写已答题归属"
+        "（旧库首启一次性回填，之后不再随题库变化）。"
     ),
-    version="1.9.0",
+    version="1.10.0",
 )
 
 
@@ -387,15 +398,23 @@ def tag_minimums_for(conn: sqlite3.Connection, session_id: str) -> dict[str, int
 
 
 def answered_by_tag(conn: sqlite3.Connection, session_id: str) -> dict[str, int]:
-    """Number of already-answered items per non-empty content tag."""
+    """Number of already-answered items per non-empty content tag.
+
+    Counts the tag **frozen into each response at answer time**
+    (``responses.content_tag``), never the item's current bank tag: a
+    later import that re-tags an answered item, or its withdrawal, must
+    not rewrite the attribution of answers already given — otherwise an
+    in-progress session's quotas would be retroactively rewritten (a met
+    quota turning deficient again, or an unmet one looking satisfied).
+    """
     counts: Counter[str] = Counter()
     rows = conn.execute(
         """
-        SELECT i.content_tag AS content_tag, COUNT(*) AS n
-        FROM responses r JOIN items i ON i.id = r.item_id
-        WHERE r.session_id = ? AND i.content_tag IS NOT NULL
-          AND i.content_tag <> ''
-        GROUP BY i.content_tag
+        SELECT r.content_tag AS content_tag, COUNT(*) AS n
+        FROM responses r
+        WHERE r.session_id = ? AND r.content_tag IS NOT NULL
+          AND r.content_tag <> ''
+        GROUP BY r.content_tag
         """,
         (session_id,),
     ).fetchall()
@@ -547,6 +566,7 @@ def serialize_response(row: sqlite3.Row) -> ResponseOut:
         correct=bool(row["score"]),
         score=row["score"],
         correct_answer=row["correct_answer"],
+        content_tag=row["content_tag"],
         theta_before=row["theta_before"],
         theta_after=row["theta_after"],
         theta_change=row["theta_after"] - row["theta_before"],
@@ -1433,7 +1453,9 @@ def next_item(
     ``tag_minimums_unfulfillable`` reason.)
 
     When the session carries ``tag_minimums``, the per-tag deficit is
-    computed from stored responses.  If the number of remaining answer slots
+    computed from the tags frozen into the stored responses at answer time
+    (a later bank re-tagging or withdrawal of an answered item never
+    rewrites its attribution).  If the number of remaining answer slots
     equals the total deficit, candidates are restricted to deficient tags
     (same information/id tie-break); otherwise all eligible items remain in
     the pool.  If a deficient tag cannot reach its quota with the items still
@@ -1816,6 +1838,12 @@ def submit_response(
     once the answered count reaches ``min_precision_items``, the standard
     error is at most ``target_se`` and all tag quotas are met.  A replayed
     request takes the idempotency branch above and never re-evaluates it.
+
+    The item's ``content_tag`` at this moment is frozen into the response
+    row; every tag-quota statistic (progress, /next deficits and the
+    precision stop's quota check) reads those frozen tags, so a later
+    re-import that re-tags the item — or its withdrawal — cannot rewrite
+    this answer's attribution.
     """
     response_key = body.response.strip().upper()
     stored_row: sqlite3.Row | None = None
@@ -1907,8 +1935,9 @@ def submit_response(
                     INSERT INTO responses (
                         id, session_id, item_id, response, score, correct_answer,
                         theta_before, theta_after, p_correct,
-                        information_at_theta, exposure_count_at_select, created_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        information_at_theta, exposure_count_at_select,
+                        content_tag, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         body.response_id,
@@ -1922,6 +1951,12 @@ def submit_response(
                         p_correct,
                         info,
                         exposure_at_select,
+                        # Freeze the item's tag as it is right now: quota
+                        # accounting everywhere reads this stored value, so
+                        # a later re-import or withdrawal of the item cannot
+                        # rewrite this answer's attribution (blank -> NULL,
+                        # matching the importer's normalisation).
+                        item["content_tag"] or None,
                         now,
                     ),
                 )
