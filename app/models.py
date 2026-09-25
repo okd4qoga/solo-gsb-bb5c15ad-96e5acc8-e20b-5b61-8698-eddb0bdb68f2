@@ -505,6 +505,13 @@ class ResponseOut(BaseModel):
     correct: bool
     score: int
     correct_answer: str
+    content_tag: str | None = Field(
+        None,
+        description=(
+            "该题作答时冻结的内容标签（取自当时题库 content_tag，无标签为 null）；"
+            "之后导入改标签或撤回题目都不会改变它，配额统计始终按此冻结值"
+        ),
+    )
     theta_before: float
     theta_after: float
     theta_change: float
@@ -574,7 +581,11 @@ class ProgressOut(BaseModel):
         default_factory=dict, description="各内容标签的最低答题配额"
     )
     tag_answered: dict[str, int] = Field(
-        default_factory=dict, description="各内容标签已答题数（按答题记录统计）"
+        default_factory=dict,
+        description=(
+            "各内容标签已答题数，按每条作答提交时冻结的 content_tag 统计；"
+            "之后题库改标签或撤回题目不影响该统计"
+        ),
     )
     target_se: float | None = Field(
         None, description="精度停测目标标准误；未启用时为 null"

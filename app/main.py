@@ -137,6 +137,10 @@ app = FastAPI(
         "单题预测概率校准对比作答前保存的 p_correct 与实际得分；"
         "题库修订历史在正式导入新增/内容变化、启用状态实际变化时"
         "于同一写事务内追加完整快照版本（旧库首启建立基线，幂等不重复）；"
+        "作答提交时冻结该题当时的 content_tag：进度、/next 配额缺口与末段"
+        "欠额限制、精度停测配额门槛均按冻结标签统计，之后导入改标签或"
+        "撤回已答题不追溯改写已答归属、不误判配额已满足或提前结束"
+        "（旧库首启按当时题库标签一次性回填）；"
         "已结束会话的错题（作答时冻结 score=0）可创建间隔复习计划（SM-2）："
         "创建时冻结题干/选项/正确答案，同一会话重复创建返回原计划；"
         "支持按 UTC 日期查询到期题与提交 0~5 分复习结果"
@@ -144,7 +148,7 @@ app = FastAPI(
         "题目或评分不同返回 409 且不改动结果与日程，冲突检查先于到期判断；"
         "仅接受已到期题，同一写事务记录结果并推进日程）。"
     ),
-    version="1.9.0",
+    version="1.10.0",
 )
 
 
@@ -387,15 +391,25 @@ def tag_minimums_for(conn: sqlite3.Connection, session_id: str) -> dict[str, int
 
 
 def answered_by_tag(conn: sqlite3.Connection, session_id: str) -> dict[str, int]:
-    """Number of already-answered items per non-empty content tag."""
+    """Number of already-answered items per non-empty content tag.
+
+    Counts come from the tag **frozen on the response row at answer time**
+    (``responses.content_tag``), not from the live ``items.content_tag``.
+    Progress, the /next quota deficit and endgame restriction, and the
+    precision-stop quota gate therefore stay stable after a later bank
+    import retags an answered item or after the item is withdrawn: an
+    already-answered item keeps the attribution it had when it was
+    answered, and a quota can neither look already met nor reopen
+    retroactively.
+    """
     counts: Counter[str] = Counter()
     rows = conn.execute(
         """
-        SELECT i.content_tag AS content_tag, COUNT(*) AS n
-        FROM responses r JOIN items i ON i.id = r.item_id
-        WHERE r.session_id = ? AND i.content_tag IS NOT NULL
-          AND i.content_tag <> ''
-        GROUP BY i.content_tag
+        SELECT content_tag, COUNT(*) AS n
+        FROM responses
+        WHERE session_id = ? AND content_tag IS NOT NULL
+          AND content_tag <> ''
+        GROUP BY content_tag
         """,
         (session_id,),
     ).fetchall()
@@ -547,6 +561,7 @@ def serialize_response(row: sqlite3.Row) -> ResponseOut:
         correct=bool(row["score"]),
         score=row["score"],
         correct_answer=row["correct_answer"],
+        content_tag=row["content_tag"],
         theta_before=row["theta_before"],
         theta_after=row["theta_after"],
         theta_change=row["theta_after"] - row["theta_before"],
@@ -1433,13 +1448,16 @@ def next_item(
     ``tag_minimums_unfulfillable`` reason.)
 
     When the session carries ``tag_minimums``, the per-tag deficit is
-    computed from stored responses.  If the number of remaining answer slots
-    equals the total deficit, candidates are restricted to deficient tags
-    (same information/id tie-break); otherwise all eligible items remain in
-    the pool.  If a deficient tag cannot reach its quota with the items still
-    eligible, the session finishes with
-    ``finish_reason = 'tag_minimums_unfulfillable'`` without serving an item
-    (hence without adding an exposure).
+    computed from the content tags **frozen on each stored response at
+    answer time** -- never from the items' current tags, so retagging or
+    withdrawing an already-answered item cannot change quota progress.
+    If the number of remaining answer slots equals the total deficit,
+    candidates are restricted to deficient tags (same information/id
+    tie-break); otherwise all eligible items remain in the pool.  If a
+    deficient tag cannot reach its quota with the items still eligible,
+    the session finishes with
+    ``finish_reason = 'tag_minimums_unfulfillable'`` without serving an
+    item (hence without adding an exposure).
 
     The whole read-check-select-write sequence runs inside one serialised
     write transaction.  That way a burst of concurrent calls on the same
@@ -1814,8 +1832,11 @@ def submit_response(
     Fisher information of every answered item is recomputed at the new theta
     and the session finishes with ``finish_reason = 'precision_reached'``
     once the answered count reaches ``min_precision_items``, the standard
-    error is at most ``target_se`` and all tag quotas are met.  A replayed
-    request takes the idempotency branch above and never re-evaluates it.
+    error is at most ``target_se`` and all tag quotas are met.  The quota
+    check counts the tags frozen on each response at answer time, so a later
+    bank retag cannot make a missing quota look met and trigger the stop
+    early.  A replayed request takes the idempotency branch above and never
+    re-evaluates it.
     """
     response_key = body.response.strip().upper()
     stored_row: sqlite3.Row | None = None
@@ -1900,6 +1921,11 @@ def submit_response(
             )
             now = utc_now()
             exposure_at_select = item["exposure_count"]
+            # Freeze the item's content tag at answer time.  Every later
+            # quota statistic (progress, /next endgame restriction,
+            # precision-stop gate) reads this copy, so retagging the bank
+            # item afterwards cannot move this answer between tags.
+            frozen_tag = item["content_tag"] or None
 
             try:
                 conn.execute(
@@ -1907,8 +1933,9 @@ def submit_response(
                     INSERT INTO responses (
                         id, session_id, item_id, response, score, correct_answer,
                         theta_before, theta_after, p_correct,
-                        information_at_theta, exposure_count_at_select, created_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        information_at_theta, exposure_count_at_select,
+                        content_tag, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         body.response_id,
@@ -1922,6 +1949,7 @@ def submit_response(
                         p_correct,
                         info,
                         exposure_at_select,
+                        frozen_tag,
                         now,
                     ),
                 )

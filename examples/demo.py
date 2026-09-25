@@ -24,6 +24,13 @@ version only for a new id or an actual content change, availability flips
 append withdraw/re_enable versions, while dry runs, failed batches and
 same-value retries create no version; old libraries receive an idempotent
 version-1 baseline at first startup.
+
+The frozen-tag section shows that each answer persists the item's
+``content_tag`` at answer time and that progress, the /next quota
+deficit/endgame restriction and the precision-stop quota gate all count
+those frozen tags: retagging an answered item by import (or withdrawing
+it) afterwards neither moves the answer between tags, nor makes a quota
+look already met, nor ends the session early.
 """
 
 from __future__ import annotations
@@ -190,6 +197,7 @@ def main() -> None:
     demo_precision_stop()
     demo_pause_resume()
     demo_withdrawal()
+    demo_frozen_tags()
     demo_revisions()
 
 
@@ -598,6 +606,239 @@ def call_status(method: str, path: str, payload: dict | None = None):
             return resp.status, json.loads(resp.read())
     except urllib.error.HTTPError as exc:
         return exc.code, json.loads(exc.read().decode())
+
+
+def demo_frozen_tags() -> None:
+    """Show answers freeze content_tag; later retags/withdrawals can't rewrite quotas."""
+    print("\n--- 作答时冻结 content_tag：导入改标签 / 撤回不追溯改写配额 ---")
+
+    # fz_item is the b=0, high-discrimination item used by group A.
+    def fz_item(iid: str, discrimination: float, tag: str) -> dict:
+        return {
+            "id": iid, "difficulty": 0.0, "discrimination": discrimination,
+            "content_tag": tag, "stem": f"冻结标签演示题 {iid}：1 + 1 = ?",
+            "options": [{"key": "A", "text": "2"}, {"key": "B", "text": "3"}],
+            "answer": "A",
+        }
+
+    # Groups B and C use b aligned with the all-correct theta trajectory
+    # (0,1,2,3 at a=2): each next item is exactly maximally informative at
+    # the theta reached after the previous answer, so a session deterministically
+    # serves the four ids in order regardless of the (a<=1.8) demo bank.
+    def track_item(iid: str, difficulty: float, tag: str) -> dict:
+        return {
+            "id": iid, "difficulty": difficulty, "discrimination": 2.0,
+            "content_tag": tag, "stem": f"冻结标签演示题 {iid}（b={difficulty:g}）",
+            "options": [{"key": "A", "text": "2"}, {"key": "B", "text": "3"}],
+            "answer": "A",
+        }
+
+    # Dedicated items per scenario.  Exposure counts are global and persist
+    # across sessions (and demo reruns), so the scenarios never share ids.
+    # Groups not yet used are withdrawn before each scenario, isolating its
+    # candidate pool and making the (information, id) picks reproducible:
+    # scenario 1 uses the b=0 group A; scenarios 2/3 use the theta-tracking
+    # groups B and C respectively.
+    fz_specs_a = [
+        ("DEMO-FZA-1", 5.0, "冻结甲"),
+        ("DEMO-FZA-2", 4.9, "冻结甲"),
+        ("DEMO-FZA-3", 4.8, "冻结乙"),
+        ("DEMO-FZA-4", 4.7, "冻结乙"),
+    ]
+    # (id, b, tag); discrimination is fixed at 2.0 by track_item.
+    fz_specs_b = [
+        ("DEMO-FZB-1", 0.0, "冻结甲"),
+        ("DEMO-FZB-2", 1.0, "冻结甲"),
+        ("DEMO-FZB-3", 2.0, "冻结乙"),
+        ("DEMO-FZB-4", 3.0, "冻结乙"),
+    ]
+    fz_specs_c = [
+        ("DEMO-FZC-1", 0.0, "冻结甲"),
+        ("DEMO-FZC-2", 1.0, "冻结乙"),
+        ("DEMO-FZC-3", 2.0, "冻结乙"),
+        ("DEMO-FZC-4", 3.0, "冻结乙"),
+    ]
+    imported_a = call(
+        "POST", "/api/items/import",
+        {"items": [fz_item(iid, a, tag) for iid, a, tag in fz_specs_a]},
+    )
+    imported_bc = call(
+        "POST", "/api/items/import",
+        {"items": [track_item(iid, b, tag)
+                   for specs in (fz_specs_b, fz_specs_c)
+                   for iid, b, tag in specs]},
+    )
+    assert imported_a["valid"] and imported_bc["valid"]
+    # Repeating the demo may leave items in any state from an earlier run:
+    # enable every item first, each scenario then withdraws the groups it
+    # does not use.
+    for specs in (fz_specs_a, fz_specs_b):
+        for iid, _, _ in specs:
+            assert call("PATCH", f"/api/items/{iid}/availability",
+                        {"is_active": True})["is_active"] is True
+    for iid, _, _ in fz_specs_c:
+        assert call("PATCH", f"/api/items/{iid}/availability",
+                    {"is_active": True})["is_active"] is True
+
+    def answer_correct(sid: str, response_id: str, item: dict) -> dict:
+        detail = call("GET", f"/api/items/{item['id']}")
+        return call(
+            "POST", f"/api/sessions/{sid}/responses",
+            {"response_id": response_id,
+             "item_id": item["id"], "response": detail["answer"]},
+        )
+
+    # 场景 1/2 不使用 group C：先整组撤回，隔离候选题池。
+    for iid, _, _ in fz_specs_c:
+        call("PATCH", f"/api/items/{iid}/availability", {"is_active": False})
+
+    # --- 场景 1：作答后改标签 + 撤回，已答归属不变、配额不会被误判已满足 ---
+    # max_items=2、配额 甲1/乙1：答完第 1 题后剩余答题位==缺口总数（1），
+    # 下一题必然走「只从欠额标签选题」的末段限制。
+    s1 = call("POST", "/api/sessions",
+              {"max_items": 2, "exposure_limit": 10_000,
+               "tag_minimums": {"冻结甲": 1, "冻结乙": 1}})
+    s1id = s1["id"]
+    first = call("POST", f"/api/sessions/{s1id}/next")["item"]
+    assert first["id"] == "DEMO-FZA-1"
+    r1 = answer_correct(s1id, f"demo-fz-{s1id[:8]}-1", first)
+    assert r1["content_tag"] == "冻结甲", "提交响应应持久化作答时的标签"
+
+    # 事后把这道已答题的标签从「冻结甲」改成「冻结乙」（导入更新）。
+    call("POST", "/api/items/import",
+         {"items": [fz_item("DEMO-FZA-1", 5.0, "冻结乙")]})
+    progress = call("GET", f"/api/sessions/{s1id}/progress")
+    history = call("GET", f"/api/sessions/{s1id}/responses")
+    frozen = history["results"][0]
+    assert frozen["content_tag"] == "冻结甲", "已答记录必须保留冻结标签"
+    assert progress["tag_answered"].get("冻结甲") == 1, \
+        "进度的已答归属不得随题库改标签"
+    assert progress["tag_answered"].get("冻结乙", 0) == 0
+    show("作答后导入改标签（冻结甲->冻结乙）：归属不被追溯改写", {
+        "题库当前标签": call("GET", "/api/items/DEMO-FZA-1")["content_tag"],
+        "答题记录冻结标签": frozen["content_tag"],
+        "tag_answered": progress["tag_answered"],
+        "tag_minimums": progress["tag_minimums"],
+    })
+    print("  -> 题库标签已改，但答题记录与进度仍按冻结的「冻结甲」统计 ✔")
+
+    # 再撤回该已答题：欠额仍为「冻结乙」1 道（FZA-3/FZA-4 可用），末段
+    # 只能从「冻结乙」选题 -> 选 FZA-3；不得因撤回而误判配额已满足或提前结束。
+    call("PATCH", "/api/items/DEMO-FZA-1/availability", {"is_active": False})
+    second = call("POST", f"/api/sessions/{s1id}/next")
+    assert second["item"] is not None and second["status"] == "active", \
+        "撤回已答题不得导致配额无法补齐而提前结束"
+    assert second["item"]["id"] == "DEMO-FZA-3", \
+        "剩余答题位 == 缺口总数时只能从欠额标签「冻结乙」选题"
+    r2 = answer_correct(s1id, f"demo-fz-{s1id[:8]}-2", second["item"])
+    assert r2["content_tag"] == "冻结乙"
+    progress = call("GET", f"/api/sessions/{s1id}/progress")
+    assert progress["status"] == "finished"
+    assert progress["finish_reason"] == "max_items"
+    assert progress["tag_answered"] == {"冻结甲": 1, "冻结乙": 1}
+    print("  -> 撤回已答题后欠额仍按冻结标签统计，末段只从「冻结乙」选出 "
+          "DEMO-FZA-3，未提前结束且配额恰好补齐 ✔")
+    # 幂等重放：改标签/撤回后重放仍返回首次结果（含冻结标签）。
+    replay = call(
+        "POST", f"/api/sessions/{s1id}/responses",
+        {"response_id": f"demo-fz-{s1id[:8]}-1",
+         "item_id": "DEMO-FZA-1", "response": "A"},
+    )
+    assert replay["created_at"] == r1["created_at"]
+    assert replay["content_tag"] == "冻结甲"
+    print("  -> 改标签并撤回后，已存 response_id 重放仍返回首次结果 ✔")
+
+    # --- 场景 2：末段欠额限制按冻结标签，改标签后仍只从欠额标签选题 ---
+    # 场景 1 的题目全部撤回（含已答的 FZA-1），确保本组按信息量排序被选中。
+    for iid, _, _ in fz_specs_a:
+        call("PATCH", f"/api/items/{iid}/availability", {"is_active": False})
+    # 配额「冻结乙」2 道。前两题（全局信息量最高的 DEMO-FZB-1/FZB-2）
+    # 作答时标签都是「冻结甲」，故缺口一直是 2；答完 2 题后剩余答题位 ==
+    # 缺口总数，此后只能出「冻结乙」题。
+    s2 = call("POST", "/api/sessions",
+              {"max_items": 4, "exposure_limit": 10_000,
+               "tag_minimums": {"冻结乙": 2}})
+    s2id = s2["id"]
+    served: list[str] = []
+    for turn in (1, 2):
+        chosen = call("POST", f"/api/sessions/{s2id}/next")
+        served.append(chosen["item"]["id"])
+        answer_correct(s2id, f"demo-fz2-{s2id[:8]}-{turn}", chosen["item"])
+    assert served == ["DEMO-FZB-1", "DEMO-FZB-2"], served
+
+    # 两道已答题冻结标签都是「冻结甲」，缺口=2、剩余位=2 -> 末段只能出
+    # 「冻结乙」。此时把已答的 FZB-1 事后改成「冻结乙」也不得改变已答
+    # 归属（冻结的是「冻结甲」）。
+    call("POST", "/api/items/import",
+         {"items": [track_item("DEMO-FZB-1", 0.0, "冻结乙")]})
+    progress = call("GET", f"/api/sessions/{s2id}/progress")
+    assert progress["tag_answered"].get("冻结乙", 0) == 0, \
+        "事后改标签不得让「冻结乙」配额看似已满足"
+    assert progress["tag_answered"].get("冻结甲") == 2
+    third = call("POST", f"/api/sessions/{s2id}/next")["item"]
+    assert third is not None and third["id"] == "DEMO-FZB-3", \
+        "FZB-1 虽被改标为「冻结乙」，但它已作答；欠额末段应选出 FZB-3"
+    answer_correct(s2id, f"demo-fz2-{s2id[:8]}-3", third)
+    fourth = call("POST", f"/api/sessions/{s2id}/next")["item"]
+    assert fourth is not None and fourth["id"] == "DEMO-FZB-4"
+    answer_correct(s2id, f"demo-fz2-{s2id[:8]}-4", fourth)
+    progress = call("GET", f"/api/sessions/{s2id}/progress")
+    assert progress["status"] == "finished"
+    assert progress["finish_reason"] == "max_items"
+    assert progress["tag_answered"]["冻结乙"] == 2
+    print("  -> 事后把已答题改成欠额标签：配额未被误判满足，末段仍只从"
+          "欠额标签选出 FZB-3/FZB-4 ✔")
+
+    # --- 场景 3：精度停测的配额门槛按冻结标签，不会因改标签提前停测 ---
+    # 场景 2（以及场景 1）的题目全部撤回，启用 group C 并隔离候选题池。
+    for specs in (fz_specs_a, fz_specs_b):
+        for iid, _, _ in specs:
+            call("PATCH", f"/api/items/{iid}/availability", {"is_active": False})
+    for iid, _, _ in fz_specs_c:
+        call("PATCH", f"/api/items/{iid}/availability", {"is_active": True})
+    # 本组 b 沿全对轨迹 0,1,2,3 排列（a=2），会话必然依次取 FZC-1..4。
+    # target_se 取很大（5.0）、min_precision_items=1：第一题作答后 SE 就已
+    # 远低于阈值，于是「标签配额是否满足」成为停测的唯一决定因素
+    # （本组每题 SE 恒远小于 5，结果可复现）。
+    s3 = call("POST", "/api/sessions",
+              {"max_items": 8, "exposure_limit": 10_000,
+               "target_se": 5.0, "min_precision_items": 1,
+               "tag_minimums": {"冻结乙": 2}})
+    s3id = s3["id"]
+    # 答第 1 题（FZC-1，冻结甲）后，把它改成「冻结乙」：旧的按题库当前
+    # 标签统计的逻辑会把这道已答题误计入「冻结乙」。
+    c1 = call("POST", f"/api/sessions/{s3id}/next")["item"]
+    assert c1["id"] == "DEMO-FZC-1"
+    answer_correct(s3id, f"demo-fz3-{s3id[:8]}-1", c1)
+    call("POST", "/api/items/import",
+         {"items": [track_item("DEMO-FZC-1", 0.0, "冻结乙")]})
+    # 第 2 题 FZC-2（冻结乙）：作答后 SE 已达标、题数 >=1。旧逻辑会把
+    # 「冻结乙」算作 改标的 FZC-1 + 真乙 FZC-2 = 2，误判配额已满足而在
+    # 第 2 题后提前 precision_reached；冻结标签下只有 FZC-2 一道（1/2），
+    # 必须继续。
+    c2 = call("POST", f"/api/sessions/{s3id}/next")
+    assert c2["item"] is not None and c2["item"]["id"] == "DEMO-FZC-2"
+    answer_correct(s3id, f"demo-fz3-{s3id[:8]}-2", c2["item"])
+    progress = call("GET", f"/api/sessions/{s3id}/progress")
+    assert progress["status"] == "active", \
+        "冻结标签下「冻结乙」仅 FZC-2 一道（1/2），第 2 题后不得提前停测"
+    assert progress["tag_answered"].get("冻结乙") == 1
+    assert progress["tag_answered"].get("冻结甲") == 1
+    # 第 3 题 FZC-3（冻结乙）：这是真正补齐配额 2/2 的一题。注意它被
+    # 选中本身说明第 2 题后会话未被旧 bug 提前结束；作答后 SE 达标且
+    # 冻结标签下配额满足 -> precision_reached。
+    c3 = call("POST", f"/api/sessions/{s3id}/next")
+    assert c3["item"] is not None and c3["item"]["id"] == "DEMO-FZC-3"
+    answer_correct(s3id, f"demo-fz3-{s3id[:8]}-3", c3["item"])
+    progress = call("GET", f"/api/sessions/{s3id}/progress")
+    assert progress["status"] == "finished", \
+        "第 3 题作答后冻结标签下「冻结乙」=FZC-2+FZC-3=2，配额真正满足，应停测"
+    assert progress["finish_reason"] == "precision_reached"
+    assert progress["tag_answered"] == {"冻结甲": 1, "冻结乙": 2}
+    assert progress["answered_count"] == 3
+    print("  -> 精度停测的配额门槛按冻结标签：改标 FZC-1 不会让第 2 题后"
+          "配额看似满足（旧逻辑会在此误判提前停测），真正的第二道"
+          "「冻结乙」FZC-3 作答后才 precision_reached ✔")
 
 
 def demo_revisions() -> None:

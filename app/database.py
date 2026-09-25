@@ -80,6 +80,15 @@ CREATE TABLE IF NOT EXISTS responses (
     p_correct                 REAL NOT NULL,
     information_at_theta      REAL NOT NULL,
     exposure_count_at_select  INTEGER NOT NULL,
+    -- Content tag frozen at answer time.  Progress tag counts, the /next
+    -- quota deficit/endgame restriction and the precision-stop quota gate
+    -- all read THIS column, never the live items.content_tag, so a later
+    -- import that retags (or a withdrawal of) an already-answered item can
+    -- neither rewrite the answer's attribution nor make a quota look
+    -- already met.  NULL means the item carried no non-empty tag when it
+    -- was answered.  Legacy rows are backfilled exactly once at first
+    -- upgrade (see _migrate_response_content_tags) and never recomputed.
+    content_tag               TEXT,
     created_at                TEXT NOT NULL,
     UNIQUE (session_id, item_id) -- an item can only be answered once per session
 );
@@ -186,11 +195,56 @@ def get_db() -> Iterator[sqlite3.Connection]:
         conn.close()
 
 
-def _ensure_column(conn: sqlite3.Connection, table: str, name: str, decl: str) -> None:
-    """Add a column to an existing table if it is missing (idempotent)."""
+def _ensure_column(
+    conn: sqlite3.Connection, table: str, name: str, decl: str
+) -> bool:
+    """Add a column to an existing table if it is missing (idempotent).
+
+    Returns ``True`` when the column had to be added (a legacy table),
+    ``False`` when it already existed.
+    """
     columns = {r[1] for r in conn.execute(f"PRAGMA table_info({table})")}
-    if name not in columns:
-        conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {decl}")
+    if name in columns:
+        return False
+    conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {decl}")
+    return True
+
+
+def _migrate_response_content_tags(conn: sqlite3.Connection) -> None:
+    """Give legacy ``responses`` rows their frozen ``content_tag`` once.
+
+    The frozen-tag column is absent on databases created before this
+    feature: its first startup adds the column and backfills every
+    historical answer from the item bank's *current* ``content_tag``
+    (``空白标签`` normalized to NULL).  This snapshot is taken exactly once:
+    the backfill is coupled to the presence-of-column migration, so on
+    every later startup the column already exists and nothing is touched
+    -- subsequent imports that retag an item (or item withdrawal) can
+    never rewrite an already-frozen answer.
+    """
+    exists = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='responses'"
+    ).fetchone()
+    if exists is None:
+        return
+    added = _ensure_column(conn, "responses", "content_tag", "TEXT")
+    if not added:
+        return
+    conn.execute(
+        """
+        UPDATE responses
+           SET content_tag = (
+                SELECT CASE
+                           WHEN i.content_tag IS NULL OR i.content_tag = ''
+                               THEN NULL
+                           ELSE i.content_tag
+                       END
+                  FROM items i
+                 WHERE i.id = responses.item_id
+            )
+         WHERE content_tag IS NULL
+        """
+    )
 
 
 # Columns copied verbatim when rebuilding the sessions table for the pause
@@ -290,6 +344,11 @@ def init_db() -> None:
         # objects that are still missing.
         _migrate_pause_support(conn)
         conn.executescript(SCHEMA)
+        # Frozen answer tags: a legacy responses table acquires the column
+        # here and its rows are backfilled from the bank's current tags
+        # exactly once; a brand-new table already carries the column, so the
+        # migration is a no-op for it.
+        _migrate_response_content_tags(conn)
         count = conn.execute("SELECT COUNT(*) FROM items").fetchone()[0]
         if count == 0:
             conn.executemany(
